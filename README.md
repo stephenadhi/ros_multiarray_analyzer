@@ -9,15 +9,9 @@ A tool for analyzing ROS2 topics containing UInt32MultiArray or UInt8MultiArray 
 
 ## Installation
 
-1. Create a virtual environment (recommended):
+1. Install dependencies above and pyqt6:
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
+sudo apt install python3-pyqt6
 ```
 
 ## Usage
