@@ -11,12 +11,183 @@ from std_msgs.msg import (UInt32MultiArray, UInt8MultiArray, Int32MultiArray,
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QComboBox, QPushButton, QTableWidget,
                            QTableWidgetItem, QLabel, QSpinBox, QLineEdit,
-                           QGroupBox, QScrollArea, QMessageBox, QCheckBox)
+                           QGroupBox, QScrollArea, QMessageBox, QCheckBox,
+                           QHeaderView, QTabWidget)
 from PyQt6.QtCore import QTimer, Qt
 import threading
 import queue
 import subprocess
 import signal
+
+class TopicDataWidget(QWidget):
+    """Widget for displaying a single topic's data"""
+    def __init__(self, topic_name, parent=None):
+        super().__init__(parent)
+        self.topic_name = topic_name
+        self.current_data = []
+        self.tracked_indices = {}
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Topic header with close button and tracking controls
+        header_layout = QHBoxLayout()
+        
+        # Left side - topic name and close button
+        topic_header = QHBoxLayout()
+        topic_header.addWidget(QLabel(f"Topic: {self.topic_name}"))
+        close_btn = QPushButton("×")
+        close_btn.setMaximumWidth(30)
+        close_btn.clicked.connect(lambda: self.parent().remove_topic_tab(self.topic_name))
+        topic_header.addWidget(close_btn)
+        header_layout.addLayout(topic_header)
+        
+        # Right side - index tracking controls
+        track_layout = QHBoxLayout()
+        self.index_spin = QSpinBox()
+        self.index_spin.setRange(0, 999)
+        self.var_name_edit = QLineEdit()
+        self.var_name_edit.setPlaceholderText("Variable Name")
+        self.track_btn = QPushButton("Track Index")
+        self.track_btn.clicked.connect(self.add_tracked_index)
+        self.clear_tracked_btn = QPushButton("Clear Tracked")
+        self.clear_tracked_btn.clicked.connect(self.clear_tracked_indices)
+        
+        track_layout.addWidget(QLabel("Index:"))
+        track_layout.addWidget(self.index_spin)
+        track_layout.addWidget(QLabel("Name:"))
+        track_layout.addWidget(self.var_name_edit)
+        track_layout.addWidget(self.track_btn)
+        track_layout.addWidget(self.clear_tracked_btn)
+        header_layout.addLayout(track_layout)
+        
+        layout.addLayout(header_layout)
+
+        # Create splitter for tracked and main tables
+        tables_layout = QHBoxLayout()
+        
+        # Tracked indices table (left side)
+        tracked_container = QWidget()
+        tracked_layout = QVBoxLayout(tracked_container)
+        tracked_layout.addWidget(QLabel("Tracked Values:"))
+        self.tracked_table = QTableWidget(0, 3)
+        self.tracked_table.setHorizontalHeaderLabels(["Index", "Name", "Value"])
+        self.tracked_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.tracked_table.setMinimumWidth(300)
+        tracked_layout.addWidget(self.tracked_table)
+        tables_layout.addWidget(tracked_container, stretch=1)
+        
+        # Main data table (right side)
+        data_container = QWidget()
+        data_layout = QVBoxLayout(data_container)
+        data_layout.addWidget(QLabel("All Array Values (100 per column):"))
+        self.table = QTableWidget(0, 0)
+        self.table.setHorizontalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
+        self.table.setVerticalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
+        self.table.setAlternatingRowColors(True)
+        data_layout.addWidget(self.table)
+        tables_layout.addWidget(data_container, stretch=2)
+        
+        layout.addLayout(tables_layout)
+
+    def update_data(self, data):
+        """Update widget with new data"""
+        self.current_data = data
+        self.update_tables()
+
+    def update_tables(self):
+        self.update_tracked_table()
+        self.update_main_table()
+
+    def update_tracked_table(self):
+        self.tracked_table.setRowCount(len(self.tracked_indices))
+        for row, (index, name) in enumerate(self.tracked_indices.items()):
+            self.tracked_table.setItem(row, 0, QTableWidgetItem(str(index)))
+            self.tracked_table.setItem(row, 1, QTableWidgetItem(name))
+            if index < len(self.current_data):
+                value = self.current_data[index]
+                if isinstance(value, float):
+                    value_str = f"{value:.3f}"
+                else:
+                    value_str = str(value)
+                self.tracked_table.setItem(row, 2, QTableWidgetItem(value_str))
+            else:
+                self.tracked_table.setItem(row, 2, QTableWidgetItem("N/A"))
+        self.tracked_table.resizeColumnsToContents()
+
+    def update_main_table(self):
+        """Update the main data table with explicit indices"""
+        if not self.current_data:
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+            return
+
+        values_per_column = 100
+        num_values = len(self.current_data)
+        num_columns = (num_values + values_per_column - 1) // values_per_column * 2
+        max_rows = min(values_per_column, num_values)
+
+        # Setup table
+        self.table.setRowCount(max_rows)
+        self.table.setColumnCount(num_columns)
+
+        # Setup headers
+        headers = []
+        for col in range(0, num_columns, 2):
+            headers.extend(["Index", "Value"])
+        self.table.setHorizontalHeaderLabels(headers)
+
+        # Fill data
+        for value_idx, value in enumerate(self.current_data):
+            column_pair = (value_idx // values_per_column) * 2
+            row = value_idx % values_per_column
+
+            # Set index
+            index_item = QTableWidgetItem(str(value_idx))
+            index_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, column_pair, index_item)
+
+            # Set value
+            if isinstance(value, float):
+                value_str = f"{value:.3f}"
+            else:
+                value_str = str(value)
+            value_item = QTableWidgetItem(value_str)
+            value_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, column_pair + 1, value_item)
+
+        # Adjust column widths
+        for col in range(num_columns):
+            self.table.resizeColumnToContents(col)
+            width = self.table.columnWidth(col)
+            self.table.setColumnWidth(col, width + 10)
+
+    def add_tracked_index(self):
+        """Add a new index to track"""
+        index = self.index_spin.value()
+        name = self.var_name_edit.text()
+        
+        if not name:
+            QMessageBox.warning(self, "Warning", "Please enter a variable name")
+            return
+            
+        if not self.current_data:
+            QMessageBox.warning(self, "Warning", "No data available")
+            return
+            
+        if index >= len(self.current_data):
+            QMessageBox.warning(self, "Warning", f"Index {index} is out of range")
+            return
+            
+        self.tracked_indices[index] = name
+        self.update_tracked_table()
+        self.var_name_edit.clear()
+
+    def clear_tracked_indices(self):
+        """Clear all tracked indices"""
+        self.tracked_indices.clear()
+        self.update_tracked_table()
 
 class ROSArrayAnalyzer(QMainWindow):
     SUPPORTED_TYPES = {
@@ -48,12 +219,9 @@ class ROSArrayAnalyzer(QMainWindow):
         self.node = None
         self.executor = None
         self.ros_thread = None
-        self.subscription = None
-        self.msg_type = None
-        self.current_data = []
-        self.tracked_indices = {}
-        self.zenoh_router_process = None
-        self.running = True # Added for thread control
+        self.subscriptions = {}  # {topic_name: subscription}
+        self.topic_widgets = {}  # {topic_name: TopicDataWidget}
+        self.zenoh_router_process = None  # For Zenoh router management
         
         # Setup UI
         self.setup_ui()
@@ -64,17 +232,15 @@ class ROSArrayAnalyzer(QMainWindow):
         # Timer for updating UI
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.process_queue)
-        self.update_timer.start(50)  # Update every 50ms
+        self.update_timer.start(50)
 
     def set_ui_enabled(self, enabled):
         """Enable or disable UI elements"""
         self.topic_combo.setEnabled(enabled)
         self.refresh_btn.setEnabled(enabled)
         self.type_filter.setEnabled(enabled)
-        self.index_spin.setEnabled(enabled)
-        self.var_name_edit.setEnabled(enabled)
-        self.track_btn.setEnabled(enabled)
-        self.clear_tracked_btn.setEnabled(enabled)
+        self.add_topic_btn.setEnabled(enabled)
+        self.tab_widget.setEnabled(enabled)
 
     def setup_ui(self):
         central_widget = QWidget()
@@ -146,89 +312,36 @@ class ROSArrayAnalyzer(QMainWindow):
         self.status_label = QLabel("Status: Not Connected")
         layout.addWidget(self.status_label)
         
-        # Topic selection
+        # Topic selection group
         topic_group = QGroupBox("Topic Selection")
         topic_layout = QHBoxLayout()
-        topic_label = QLabel("Select Topic:")
+        topic_label = QLabel("Add Topic:")
         self.topic_combo = QComboBox()
         self.refresh_btn = QPushButton("Refresh Topics")
         self.refresh_btn.clicked.connect(self.refresh_topics)
         
-        # Add type filter
         self.type_filter = QComboBox()
         self.type_filter.addItem("All Types")
         self.type_filter.addItems(sorted(self.SUPPORTED_TYPES.keys()))
         self.type_filter.currentTextChanged.connect(self.refresh_topics)
+        
+        self.add_topic_btn = QPushButton("Add Topic")
+        self.add_topic_btn.clicked.connect(self.add_selected_topic)
         
         topic_layout.addWidget(topic_label)
         topic_layout.addWidget(self.topic_combo)
         topic_layout.addWidget(QLabel("Filter Type:"))
         topic_layout.addWidget(self.type_filter)
         topic_layout.addWidget(self.refresh_btn)
+        topic_layout.addWidget(self.add_topic_btn)
         topic_group.setLayout(topic_layout)
         layout.addWidget(topic_group)
         
-        # Data type display
-        self.type_label = QLabel("Data Type: Not Selected")
-        layout.addWidget(self.type_label)
-        
-        # Statistics Group
-        stats_group = QGroupBox("Array Statistics")
-        stats_layout = QHBoxLayout()
-        self.length_label = QLabel("Length: 0")
-        self.min_label = QLabel("Min: N/A")
-        self.max_label = QLabel("Max: N/A")
-        self.avg_label = QLabel("Avg: N/A")
-        stats_layout.addWidget(self.length_label)
-        stats_layout.addWidget(self.min_label)
-        stats_layout.addWidget(self.max_label)
-        stats_layout.addWidget(self.avg_label)
-        stats_group.setLayout(stats_layout)
-        layout.addWidget(stats_group)
-        
-        # Index tracking controls
-        track_group = QGroupBox("Track Specific Indices")
-        track_layout = QHBoxLayout()
-        self.index_spin = QSpinBox()
-        self.index_spin.setRange(0, 999)
-        self.var_name_edit = QLineEdit()
-        self.var_name_edit.setPlaceholderText("Variable Name")
-        self.track_btn = QPushButton("Track Index")
-        self.track_btn.clicked.connect(self.add_tracked_index)
-        self.clear_tracked_btn = QPushButton("Clear Tracked")
-        self.clear_tracked_btn.clicked.connect(self.clear_tracked_indices)
-        track_layout.addWidget(QLabel("Index:"))
-        track_layout.addWidget(self.index_spin)
-        track_layout.addWidget(QLabel("Name:"))
-        track_layout.addWidget(self.var_name_edit)
-        track_layout.addWidget(self.track_btn)
-        track_layout.addWidget(self.clear_tracked_btn)
-        track_group.setLayout(track_layout)
-        layout.addWidget(track_group)
-        
-        # Tracked indices table
-        self.tracked_table = QTableWidget(0, 3)
-        self.tracked_table.setHorizontalHeaderLabels(["Index", "Name", "Value"])
-        self.tracked_table.setMinimumHeight(150)
-        layout.addWidget(self.tracked_table)
-        
-        # All values table
-        table_label = QLabel("All Array Values:")
-        layout.addWidget(table_label)
-        
-        # Make the main table scrollable
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Index", "Value"])
-        scroll.setWidget(self.table)
-        layout.addWidget(scroll)
-        
-        # Connect topic selection signal
-        self.topic_combo.currentTextChanged.connect(self.subscribe_to_topic)
-        
-        # Initial topic refresh
-        self.refresh_topics()
+        # Tab widget for multiple topics
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setTabsClosable(True)
+        self.tab_widget.tabCloseRequested.connect(self.remove_topic_tab)
+        layout.addWidget(self.tab_widget)
 
     def on_rmw_changed(self, rmw_name):
         """Handle RMW implementation change"""
@@ -282,8 +395,8 @@ class ROSArrayAnalyzer(QMainWindow):
                                           f"Failed to start Zenoh router: {str(e)}\n"
                                           "Will attempt to connect to existing router.")
                         return self.continue_ros_init()
-            
-            return self.continue_ros_init()
+            else:  # FastRTPS
+                return self.continue_ros_init()
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to initialize ROS2: {str(e)}")
@@ -323,6 +436,21 @@ class ROSArrayAnalyzer(QMainWindow):
 
     def cleanup_ros(self):
         """Clean up ROS2 resources"""
+        # Clean up all topic subscriptions
+        for topic_name in list(self.subscriptions.keys()):
+            if topic_name in self.subscriptions:
+                self.node.destroy_subscription(self.subscriptions[topic_name])
+                del self.subscriptions[topic_name]
+        
+        # Clean up all topic widgets
+        for topic_name in list(self.topic_widgets.keys()):
+            if topic_name in self.topic_widgets:
+                del self.topic_widgets[topic_name]
+        
+        # Clear all tabs
+        while self.tab_widget.count() > 0:
+            self.tab_widget.removeTab(0)
+        
         # Stop Zenoh router if we started it
         if self.zenoh_router_process:
             try:
@@ -332,43 +460,29 @@ class ROSArrayAnalyzer(QMainWindow):
                 print(f"Router cleanup error (continuing): {str(e)}")
             self.zenoh_router_process = None
         
-        # Signal thread to stop
-        self.running = False
-        
-        # Clean up executor
+        # Clean up ROS2 node and executor
         if self.executor:
             try:
                 self.executor.shutdown()
-                self.executor = None
             except Exception as e:
                 print(f"Executor shutdown error (continuing): {str(e)}")
-
-        # Clean up node
+            self.executor = None
+        
         if self.node:
             try:
                 self.node.destroy_node()
-                self.node = None
             except Exception as e:
                 print(f"Node cleanup error (continuing): {str(e)}")
-
+            self.node = None
+        
         # Shutdown ROS2 if it's running
         if rclpy.ok():
             try:
                 rclpy.shutdown()
             except Exception as e:
                 print(f"ROS2 shutdown error (continuing): {str(e)}")
-
-        # Wait for thread to finish
-        if self.ros_thread and self.ros_thread.is_alive():
-            try:
-                self.ros_thread.join(timeout=2.0)
-            except Exception as e:
-                print(f"Thread join error (continuing): {str(e)}")
-            self.ros_thread = None
-
-        # Clear any remaining data
-        self.subscription = None
-        self.msg_type = None
+        
+        # Clear the message queue
         while not self.data_queue.empty():
             try:
                 self.data_queue.get_nowait()
@@ -382,10 +496,9 @@ class ROSArrayAnalyzer(QMainWindow):
             self.status_label.setText("Status: Connecting...")
             self.set_ui_enabled(False)
             
-            # Clear existing data
-            self.current_data = []
-            self.tracked_indices.clear()
-            self.update_display()
+            # Clear existing data and tabs
+            while self.tab_widget.count() > 0:
+                self.remove_topic_tab(0)
             
             # Initialize ROS2 with new domain
             if self.init_ros():
@@ -419,8 +532,8 @@ class ROSArrayAnalyzer(QMainWindow):
         if not topic_name or not self.node:
             return
             
-        if self.subscription:
-            self.node.destroy_subscription(self.subscription)
+        if topic_name in self.subscriptions:
+            self.node.destroy_subscription(self.subscriptions[topic_name])
         
         # Get topic type
         for name, types in self.node.get_topic_names_and_types():
@@ -432,85 +545,31 @@ class ROSArrayAnalyzer(QMainWindow):
                     break
         
         if self.msg_type:
-            self.subscription = self.node.create_subscription(
+            self.subscriptions[topic_name] = self.node.create_subscription(
                 self.msg_type,
                 topic_name,
-                self.topic_callback,
+                lambda msg, topic=topic_name: self.topic_callback(msg, topic),
                 10)
             
             # Reset statistics
             self.update_statistics([])
 
-    def topic_callback(self, msg):
-        """Thread-safe message handling"""
-        self.data_queue.put(msg.data)
+    def topic_callback(self, msg, topic_name):
+        """Handle message from a specific topic"""
+        if topic_name in self.topic_widgets:
+            self.data_queue.put((topic_name, msg.data))
 
     def update_statistics(self, data):
-        if not data:
-            self.length_label.setText("Length: 0")
-            self.min_label.setText("Min: N/A")
-            self.max_label.setText("Max: N/A")
-            self.avg_label.setText("Avg: N/A")
-            return
-            
-        try:
-            self.length_label.setText(f"Length: {len(data)}")
-            self.min_label.setText(f"Min: {min(data):.3f}")
-            self.max_label.setText(f"Max: {max(data):.3f}")
-            self.avg_label.setText(f"Avg: {sum(data)/len(data):.3f}")
-        except (TypeError, ValueError):
-            # Handle case where data cannot be converted to float
-            self.min_label.setText(f"Min: {min(data)}")
-            self.max_label.setText(f"Max: {max(data)}")
-            self.avg_label.setText("Avg: N/A")
-
-    def add_tracked_index(self):
-        index = self.index_spin.value()
-        name = self.var_name_edit.text()
-        
-        if not name:
-            QMessageBox.warning(self, "Warning", "Please enter a variable name")
-            return
-            
-        if not self.current_data:
-            QMessageBox.warning(self, "Warning", "No data available")
-            return
-            
-        if index >= len(self.current_data):
-            QMessageBox.warning(self, "Warning", f"Index {index} is out of range")
-            return
-            
-        self.tracked_indices[index] = name
-        self.update_tracked_table()
-        self.var_name_edit.clear()
-
-    def clear_tracked_indices(self):
-        self.tracked_indices.clear()
-        self.update_tracked_table()
-
-    def update_tracked_table(self):
-        self.tracked_table.setRowCount(len(self.tracked_indices))
-        for row, (index, name) in enumerate(self.tracked_indices.items()):
-            self.tracked_table.setItem(row, 0, QTableWidgetItem(str(index)))
-            self.tracked_table.setItem(row, 1, QTableWidgetItem(name))
-            if index < len(self.current_data):
-                value = self.current_data[index]
-                if isinstance(value, float):
-                    value_str = f"{value:.3f}"
-                else:
-                    value_str = str(value)
-                self.tracked_table.setItem(row, 2, QTableWidgetItem(value_str))
-            else:
-                self.tracked_table.setItem(row, 2, QTableWidgetItem("N/A"))
+        """Removed statistics update as no longer needed"""
+        pass
 
     def process_queue(self):
         """Process any pending data from the ROS thread"""
         try:
-            while True:  # Process all available messages
-                data = self.data_queue.get_nowait()
-                self.current_data = data
-                self.update_statistics(data)
-                self.update_display()
+            while True:
+                topic_name, data = self.data_queue.get_nowait()
+                if topic_name in self.topic_widgets:
+                    self.topic_widgets[topic_name].update_data(data)
         except queue.Empty:
             pass
 
@@ -520,17 +579,104 @@ class ROSArrayAnalyzer(QMainWindow):
         self.update_main_table()
 
     def update_main_table(self):
-        """Update the main data table"""
-        self.table.setRowCount(len(self.current_data))
-        for i, value in enumerate(self.current_data):
-            if self.table.item(i, 0) is None:
-                self.table.setItem(i, 0, QTableWidgetItem(str(i)))
-            
+        """Update the main data table with multi-column layout (100 values per column)"""
+        if not self.current_data:
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+            return
+
+        # Calculate number of columns needed (each column holds 100 values)
+        values_per_column = 100
+        num_values = len(self.current_data)
+        num_columns = (num_values + values_per_column - 1) // values_per_column * 2  # *2 for index+value columns
+        max_rows = min(values_per_column, num_values)
+
+        # Setup table
+        self.table.setRowCount(max_rows)
+        self.table.setColumnCount(num_columns)
+
+        # Setup headers
+        headers = []
+        for col in range(0, num_columns, 2):
+            start_idx = (col // 2) * values_per_column
+            headers.extend([f"Index ({start_idx}-{min(start_idx + values_per_column - 1, num_values - 1)})", "Value"])
+        self.table.setHorizontalHeaderLabels(headers)
+
+        # Fill data
+        for value_idx, value in enumerate(self.current_data):
+            # Calculate which column pair and row this value belongs to
+            column_pair = (value_idx // values_per_column) * 2
+            row = value_idx % values_per_column
+
+            # Set index
+            index_item = QTableWidgetItem(str(value_idx))
+            index_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, column_pair, index_item)
+
+            # Set value
             if isinstance(value, float):
                 value_str = f"{value:.3f}"
             else:
                 value_str = str(value)
-            self.table.setItem(i, 1, QTableWidgetItem(value_str))
+            value_item = QTableWidgetItem(value_str)
+            value_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, column_pair + 1, value_item)
+
+        # Adjust column widths and make them fixed
+        for col in range(num_columns):
+            self.table.resizeColumnToContents(col)
+            width = self.table.columnWidth(col)
+            self.table.setColumnWidth(col, width + 10)  # Add a little padding
+
+        # Enable sorting
+        self.table.setSortingEnabled(True)
+
+    def add_selected_topic(self):
+        topic_name = self.topic_combo.currentText()
+        if not topic_name or topic_name in self.topic_widgets:
+            return
+
+        # Create widget and subscription for the topic
+        widget = TopicDataWidget(topic_name)
+        self.topic_widgets[topic_name] = widget
+        self.tab_widget.addTab(widget, topic_name)
+        
+        # Create subscription
+        for name, types in self.node.get_topic_names_and_types():
+            if name == topic_name:
+                type_name = types[0].split('/')[-1]
+                if type_name in self.SUPPORTED_TYPES:
+                    msg_type = self.SUPPORTED_TYPES[type_name]
+                    self.subscriptions[topic_name] = self.node.create_subscription(
+                        msg_type,
+                        topic_name,
+                        lambda msg, topic=topic_name: self.topic_callback(msg, topic),
+                        10)
+                    break
+
+    def remove_topic_tab(self, index_or_name):
+        if isinstance(index_or_name, str):
+            # Find the index for the topic name
+            for i in range(self.tab_widget.count()):
+                if self.tab_widget.tabText(i) == index_or_name:
+                    index = i
+                    break
+        else:
+            index = index_or_name
+            
+        topic_name = self.tab_widget.tabText(index)
+        
+        # Remove subscription
+        if topic_name in self.subscriptions:
+            self.node.destroy_subscription(self.subscriptions[topic_name])
+            del self.subscriptions[topic_name]
+        
+        # Remove widget
+        if topic_name in self.topic_widgets:
+            del self.topic_widgets[topic_name]
+        
+        # Remove tab
+        self.tab_widget.removeTab(index)
 
     def ros_spin(self):
         """ROS2 spin loop with Zenoh-specific error handling"""
