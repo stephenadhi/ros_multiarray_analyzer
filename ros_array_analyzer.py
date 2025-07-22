@@ -11,10 +11,12 @@ from std_msgs.msg import (UInt32MultiArray, UInt8MultiArray, Int32MultiArray,
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QComboBox, QPushButton, QTableWidget,
                            QTableWidgetItem, QLabel, QSpinBox, QLineEdit,
-                           QGroupBox, QScrollArea, QMessageBox)
+                           QGroupBox, QScrollArea, QMessageBox, QCheckBox)
 from PyQt6.QtCore import QTimer, Qt
 import threading
 import queue
+import subprocess
+import signal
 
 class ROSArrayAnalyzer(QMainWindow):
     SUPPORTED_TYPES = {
@@ -30,9 +32,14 @@ class ROSArrayAnalyzer(QMainWindow):
         'Float64MultiArray': Float64MultiArray,
     }
 
+    RMW_IMPLEMENTATIONS = {
+        'Zenoh': 'rmw_zenoh_cpp',
+        'FastRTPS': 'rmw_fastrtps_cpp'
+    }
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ROS2 Array Analyzer (Zenoh)")
+        self.setWindowTitle("ROS2 Array Analyzer")
         self.setGeometry(100, 100, 1200, 800)
         
         # Initialize variables
@@ -45,6 +52,7 @@ class ROSArrayAnalyzer(QMainWindow):
         self.msg_type = None
         self.current_data = []
         self.tracked_indices = {}
+        self.zenoh_router_process = None
         self.running = True # Added for thread control
         
         # Setup UI
@@ -73,22 +81,66 @@ class ROSArrayAnalyzer(QMainWindow):
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         
-        # Domain ID selector
-        domain_group = QGroupBox("ROS2 Domain Configuration")
-        domain_layout = QHBoxLayout()
+        # Domain ID selector and RMW configuration
+        config_group = QGroupBox("ROS2 Configuration")
+        config_layout = QVBoxLayout()
+        
+        # RMW Implementation selector
+        rmw_row = QHBoxLayout()
+        rmw_label = QLabel("RMW Implementation:")
+        self.rmw_combo = QComboBox()
+        self.rmw_combo.addItems(self.RMW_IMPLEMENTATIONS.keys())
+        self.rmw_combo.setCurrentText("Zenoh")  # Default to Zenoh
+        self.rmw_combo.currentTextChanged.connect(self.on_rmw_changed)
+        
+        rmw_row.addWidget(rmw_label)
+        rmw_row.addWidget(self.rmw_combo)
+        rmw_row.addStretch()
+        
+        # Domain ID row
+        domain_row = QHBoxLayout()
         domain_label = QLabel("Domain ID:")
         self.domain_spin = QSpinBox()
-        self.domain_spin.setRange(0, 232)  # ROS2 domain ID range
+        self.domain_spin.setRange(0, 232)
         self.domain_spin.setValue(self.current_domain_id)
         self.domain_apply_btn = QPushButton("Start ROS2 Connection")
         self.domain_apply_btn.clicked.connect(self.change_domain)
         
-        domain_layout.addWidget(domain_label)
-        domain_layout.addWidget(self.domain_spin)
-        domain_layout.addWidget(self.domain_apply_btn)
-        domain_layout.addStretch()
-        domain_group.setLayout(domain_layout)
-        layout.addWidget(domain_group)
+        domain_row.addWidget(domain_label)
+        domain_row.addWidget(self.domain_spin)
+        domain_row.addWidget(self.domain_apply_btn)
+        domain_row.addStretch()
+        
+        # Zenoh specific configuration row
+        self.zenoh_config_group = QGroupBox("Zenoh Configuration")
+        zenoh_layout = QHBoxLayout()
+        self.start_router_cb = QCheckBox("Start Zenoh Router")
+        self.start_router_cb.setChecked(False)
+        self.peer_discovery_cb = QCheckBox("Enable Peer Discovery")
+        self.peer_discovery_cb.setChecked(True)
+        
+        self.start_router_cb.setToolTip(
+            "Check this if you want the application to start a Zenoh router.\n"
+            "Leave unchecked if you already have a router running."
+        )
+        self.peer_discovery_cb.setToolTip(
+            "Enable multicast-based peer discovery.\n"
+            "Useful when connecting to other ROS2 nodes on the network."
+        )
+        
+        zenoh_layout.addWidget(self.start_router_cb)
+        zenoh_layout.addWidget(self.peer_discovery_cb)
+        zenoh_layout.addStretch()
+        self.zenoh_config_group.setLayout(zenoh_layout)
+        
+        # Add all rows to config layout
+        config_layout.addLayout(rmw_row)
+        config_layout.addLayout(domain_row)
+        config_group.setLayout(config_layout)
+        
+        # Add groups to main layout
+        layout.addWidget(config_group)
+        layout.addWidget(self.zenoh_config_group)
         
         # Connection status
         self.status_label = QLabel("Status: Not Connected")
@@ -178,16 +230,69 @@ class ROSArrayAnalyzer(QMainWindow):
         # Initial topic refresh
         self.refresh_topics()
 
+    def on_rmw_changed(self, rmw_name):
+        """Handle RMW implementation change"""
+        # Show/hide Zenoh specific configuration
+        self.zenoh_config_group.setVisible(rmw_name == "Zenoh")
+        
+        if self.node:  # If already connected, warn about reconnection needed
+            QMessageBox.information(self, "RMW Changed",
+                                  "Please reconnect to apply the new RMW implementation.")
+
     def init_ros(self):
         """Initialize or reinitialize ROS2 with current domain ID"""
         try:
             # Clean up existing ROS2 resources
             self.cleanup_ros()
             
-            # Set RMW implementation to Zenoh
-            os.environ['RMW_IMPLEMENTATION'] = 'rmw_zenoh_cpp'
+            # Set RMW implementation
+            rmw_name = self.rmw_combo.currentText()
+            os.environ['RMW_IMPLEMENTATION'] = self.RMW_IMPLEMENTATIONS[rmw_name]
             os.environ['ROS_DOMAIN_ID'] = str(self.current_domain_id)
             
+            if rmw_name == "Zenoh":
+                # Configure Zenoh peer discovery
+                if self.peer_discovery_cb.isChecked():
+                    os.environ['ZENOH_PEER_MULTICAST_ENABLED'] = 'true'
+                    os.environ['ZENOH_PEER_MULTICAST_ADDRESS'] = '224.0.0.224'
+                    os.environ['ZENOH_PEER_MULTICAST_INTERFACE'] = 'auto'
+                else:
+                    os.environ['ZENOH_PEER_MULTICAST_ENABLED'] = 'false'
+                
+                # Start Zenoh router if requested
+                if self.start_router_cb.isChecked():
+                    try:
+                        # Kill any existing router process
+                        if self.zenoh_router_process:
+                            self.zenoh_router_process.terminate()
+                            self.zenoh_router_process.wait(timeout=2)
+                        
+                        # Start new router process
+                        self.zenoh_router_process = subprocess.Popen(
+                            ['ros2', 'run', 'rmw_zenoh_cpp', 'rmw_zenohd'],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            preexec_fn=os.setsid
+                        )
+                        # Give the router a moment to start
+                        QTimer.singleShot(1000, self.continue_ros_init)
+                        return True
+                    except Exception as e:
+                        QMessageBox.warning(self, "Warning", 
+                                          f"Failed to start Zenoh router: {str(e)}\n"
+                                          "Will attempt to connect to existing router.")
+                        return self.continue_ros_init()
+            
+            return self.continue_ros_init()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to initialize ROS2: {str(e)}")
+            self.status_label.setText("Status: Connection Failed")
+            return False
+
+    def continue_ros_init(self):
+        """Continue ROS2 initialization after router setup"""
+        try:
             # Initialize ROS2
             if not rclpy.ok():
                 rclpy.init()
@@ -211,7 +316,6 @@ class ROSArrayAnalyzer(QMainWindow):
             self.refresh_topics()
             
             return True
-            
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to initialize ROS2: {str(e)}")
             self.status_label.setText("Status: Connection Failed")
@@ -219,6 +323,15 @@ class ROSArrayAnalyzer(QMainWindow):
 
     def cleanup_ros(self):
         """Clean up ROS2 resources"""
+        # Stop Zenoh router if we started it
+        if self.zenoh_router_process:
+            try:
+                os.killpg(os.getpgid(self.zenoh_router_process.pid), signal.SIGTERM)
+                self.zenoh_router_process.wait(timeout=2)
+            except Exception as e:
+                print(f"Router cleanup error (continuing): {str(e)}")
+            self.zenoh_router_process = None
+        
         # Signal thread to stop
         self.running = False
         
