@@ -1,0 +1,26 @@
+version: '3'
+
+services:
+  analyzer:
+    build: .
+    environment:
+      - DISPLAY=${DISPLAY}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - RMW_IMPLEMENTATION=rmw_zenoh_cpp
+      - ZENOH_MULTICAST_ENABLED=true
+      - ZENOH_MULTICAST_IPV4_ADDRESS=224.0.0.224
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - .:/ros2_analyzer
+    network_mode: "host"
+    command: python3 ros_array_analyzer.py
+
+  publisher:
+    build: .
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - RMW_IMPLEMENTATION=rmw_zenoh_cpp
+      - ZENOH_MULTICAST_ENABLED=true
+      - ZENOH_MULTICAST_IPV4_ADDRESS=224.0.0.224
+    network_mode: "host"
+    command: python3 test_publisher.py 
