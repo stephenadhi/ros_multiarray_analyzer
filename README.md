@@ -12,6 +12,7 @@ A tool for analyzing ROS2 topics containing UInt32MultiArray or UInt8MultiArray 
 1. Install dependencies above and pyqt6:
 ```bash
 sudo apt install python3-pyqt6
+sudo apt-get install python3-pyqt6.qtcharts
 ```
 
 ## Usage

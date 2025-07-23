@@ -12,8 +12,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QComboBox, QPushButton, QTableWidget,
                            QTableWidgetItem, QLabel, QSpinBox, QLineEdit,
                            QGroupBox, QScrollArea, QMessageBox, QCheckBox,
-                           QHeaderView, QTabWidget, QFileDialog)
-from PyQt6.QtCore import QTimer, Qt
+                           QHeaderView, QTabWidget, QFileDialog, QDoubleSpinBox)
+from PyQt6.QtCore import QTimer, Qt, QDateTime, QPointF
+from PyQt6.QtGui import QPainter
+from PyQt6.QtCharts import QChart, QChartView, QLineSeries, QDateTimeAxis, QValueAxis
 import threading
 import queue
 import subprocess
@@ -21,6 +23,8 @@ import signal
 import json
 import yaml
 import re
+from collections import deque
+from datetime import datetime, timedelta
 
 def parse_json5(content):
     """Parse JSON5 format (simplified parser for Zenoh config)"""
@@ -35,6 +39,189 @@ def parse_json5(content):
     
     # Parse as regular JSON
     return json.loads(content)
+
+class GraphWidget(QWidget):
+    """Widget for real-time plotting of array values"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+        # Initialize attributes first
+        self.series_data = {}  # {name: (series, deque)}
+        self.time_window = 60  # seconds
+        self.y_min = float('-inf')
+        self.y_max = float('inf')
+        self.auto_y_scale = True
+        
+        # Setup UI after attributes are initialized
+        self.setup_ui()
+        
+        # Timer for removing old data points
+        self.cleanup_timer = QTimer(self)
+        self.cleanup_timer.timeout.connect(self.cleanup_old_data)
+        self.cleanup_timer.start(1000)  # Cleanup every second
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Controls
+        controls_layout = QHBoxLayout()
+        
+        # Time window control
+        time_window_layout = QHBoxLayout()
+        time_window_layout.addWidget(QLabel("Time Window (s):"))
+        self.time_window_spin = QSpinBox()
+        self.time_window_spin.setRange(1, 3600)
+        self.time_window_spin.setValue(self.time_window)
+        self.time_window_spin.valueChanged.connect(self.update_time_window)
+        time_window_layout.addWidget(self.time_window_spin)
+        controls_layout.addLayout(time_window_layout)
+        
+        # Y-axis range controls
+        y_range_layout = QHBoxLayout()
+        self.auto_scale_cb = QCheckBox("Auto Y-Scale")
+        self.auto_scale_cb.setChecked(self.auto_y_scale)
+        self.auto_scale_cb.stateChanged.connect(self.toggle_auto_scale)
+        y_range_layout.addWidget(self.auto_scale_cb)
+        
+        y_range_layout.addWidget(QLabel("Y Min:"))
+        self.y_min_spin = QDoubleSpinBox()
+        self.y_min_spin.setRange(float('-inf'), float('inf'))
+        self.y_min_spin.setEnabled(not self.auto_y_scale)
+        self.y_min_spin.valueChanged.connect(self.update_y_range)
+        y_range_layout.addWidget(self.y_min_spin)
+        
+        y_range_layout.addWidget(QLabel("Y Max:"))
+        self.y_max_spin = QDoubleSpinBox()
+        self.y_max_spin.setRange(float('-inf'), float('inf'))
+        self.y_max_spin.setEnabled(not self.auto_y_scale)
+        self.y_max_spin.valueChanged.connect(self.update_y_range)
+        y_range_layout.addWidget(self.y_max_spin)
+        
+        controls_layout.addLayout(y_range_layout)
+        controls_layout.addStretch()
+        
+        layout.addLayout(controls_layout)
+        
+        # Chart
+        self.chart = QChart()
+        self.chart.setTitle("Real-time Array Values")
+        self.chart.legend().setVisible(True)
+        self.chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+        
+        # Axes
+        self.axis_x = QDateTimeAxis()
+        self.axis_x.setFormat("hh:mm:ss")
+        self.axis_x.setTitleText("Time")
+        self.chart.addAxis(self.axis_x, Qt.AlignmentFlag.AlignBottom)
+        
+        self.axis_y = QValueAxis()
+        self.axis_y.setTitleText("Value")
+        self.chart.addAxis(self.axis_y, Qt.AlignmentFlag.AlignLeft)
+        
+        # Chart view
+        self.chart_view = QChartView(self.chart)
+        self.chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        layout.addWidget(self.chart_view)
+        
+        self.update_axes_range()
+
+    def add_series(self, name):
+        """Add a new data series to the chart"""
+        if name not in self.series_data:
+            series = QLineSeries()
+            series.setName(name)
+            self.chart.addSeries(series)
+            series.attachAxis(self.axis_x)
+            series.attachAxis(self.axis_y)
+            self.series_data[name] = (series, deque(maxlen=self.time_window * 10))  # Store 10 points per second
+
+    def remove_series(self, name):
+        """Remove a data series from the chart"""
+        if name in self.series_data:
+            series, _ = self.series_data[name]
+            self.chart.removeSeries(series)
+            del self.series_data[name]
+
+    def update_data(self, name, value):
+        """Add a new data point to the series"""
+        if name not in self.series_data:
+            self.add_series(name)
+            
+        series, data_queue = self.series_data[name]
+        timestamp = QDateTime.currentDateTime().toMSecsSinceEpoch()
+        data_queue.append((timestamp, value))
+        
+        # Update series data
+        points = [QPointF(t, v) for t, v in data_queue]
+        series.replace(points)
+        
+        if self.auto_y_scale:
+            self.update_y_scale()
+        self.update_axes_range()
+
+    def update_time_window(self, value):
+        """Update the time window for the x-axis"""
+        self.time_window = value
+        for series, data_queue in self.series_data.values():
+            data_queue.maxlen = value * 10
+        self.update_axes_range()
+
+    def update_y_range(self):
+        """Update the y-axis range"""
+        if not self.auto_y_scale:
+            self.y_min = self.y_min_spin.value()
+            self.y_max = self.y_max_spin.value()
+            self.axis_y.setRange(self.y_min, self.y_max)
+
+    def toggle_auto_scale(self, state):
+        """Toggle automatic y-axis scaling"""
+        self.auto_y_scale = bool(state)
+        self.y_min_spin.setEnabled(not self.auto_y_scale)
+        self.y_max_spin.setEnabled(not self.auto_y_scale)
+        if self.auto_y_scale:
+            self.update_y_scale()
+
+    def update_y_scale(self):
+        """Update y-axis scale based on current data"""
+        if not self.series_data:
+            return
+            
+        min_val = float('inf')
+        max_val = float('-inf')
+        
+        for _, data_queue in self.series_data.values():
+            if data_queue:
+                values = [v for _, v in data_queue]
+                min_val = min(min_val, min(values))
+                max_val = max(max_val, max(values))
+        
+        if min_val != float('inf') and max_val != float('-inf'):
+            margin = (max_val - min_val) * 0.1
+            self.axis_y.setRange(min_val - margin, max_val + margin)
+
+    def update_axes_range(self):
+        """Update the axes ranges"""
+        now = QDateTime.currentDateTime()
+        self.axis_x.setRange(
+            now.addSecs(-self.time_window),
+            now
+        )
+
+    def cleanup_old_data(self):
+        """Remove data points outside the time window"""
+        if not self.series_data:
+            return
+            
+        cutoff_time = QDateTime.currentDateTime().addSecs(-self.time_window).toMSecsSinceEpoch()
+        
+        for name, (series, data_queue) in self.series_data.items():
+            while data_queue and data_queue[0][0] < cutoff_time:
+                data_queue.popleft()
+            
+            points = [QPointF(t, v) for t, v in data_queue]
+            series.replace(points)
+        
+        self.update_axes_range()
 
 class TopicDataWidget(QWidget):
     """Widget for displaying a single topic's data"""
@@ -81,8 +268,12 @@ class TopicDataWidget(QWidget):
         
         layout.addLayout(header_layout)
 
-        # Create splitter for tracked and main tables
-        tables_layout = QHBoxLayout()
+        # Create tab widget for tables and graph
+        self.view_tabs = QTabWidget()
+        
+        # Data tables tab
+        tables_widget = QWidget()
+        tables_layout = QHBoxLayout(tables_widget)
         
         # Tracked indices table (left side)
         tracked_container = QWidget()
@@ -106,12 +297,19 @@ class TopicDataWidget(QWidget):
         data_layout.addWidget(self.table)
         tables_layout.addWidget(data_container, stretch=2)
         
-        layout.addLayout(tables_layout)
+        self.view_tabs.addTab(tables_widget, "Data Tables")
+        
+        # Graph tab
+        self.graph_widget = GraphWidget()
+        self.view_tabs.addTab(self.graph_widget, "Real-time Graph")
+        
+        layout.addWidget(self.view_tabs)
 
     def update_data(self, data):
         """Update widget with new data"""
         self.current_data = data
         self.update_tables()
+        self.update_graph()
 
     def update_tables(self):
         self.update_tracked_table()
@@ -129,9 +327,16 @@ class TopicDataWidget(QWidget):
                 else:
                     value_str = str(value)
                 self.tracked_table.setItem(row, 2, QTableWidgetItem(value_str))
+                # Update graph data
+                self.graph_widget.update_data(name, value)
             else:
                 self.tracked_table.setItem(row, 2, QTableWidgetItem("N/A"))
         self.tracked_table.resizeColumnsToContents()
+
+    def update_graph(self):
+        """Update graph with current data"""
+        # Graph is updated through update_tracked_table
+        pass
 
     def update_main_table(self):
         """Update the main data table with explicit indices"""
@@ -203,6 +408,10 @@ class TopicDataWidget(QWidget):
 
     def clear_tracked_indices(self):
         """Clear all tracked indices"""
+        # Remove all series from the graph
+        for name in list(self.tracked_indices.keys()):
+            self.graph_widget.remove_series(name)
+        
         self.tracked_indices.clear()
         self.update_tracked_table()
 
