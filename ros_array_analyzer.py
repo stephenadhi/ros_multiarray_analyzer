@@ -12,12 +12,29 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QComboBox, QPushButton, QTableWidget,
                            QTableWidgetItem, QLabel, QSpinBox, QLineEdit,
                            QGroupBox, QScrollArea, QMessageBox, QCheckBox,
-                           QHeaderView, QTabWidget)
+                           QHeaderView, QTabWidget, QFileDialog)
 from PyQt6.QtCore import QTimer, Qt
 import threading
 import queue
 import subprocess
 import signal
+import json
+import yaml
+import re
+
+def parse_json5(content):
+    """Parse JSON5 format (simplified parser for Zenoh config)"""
+    # Remove comments
+    content = re.sub(r'//.*?\n|/\*.*?\*/', '', content, flags=re.DOTALL)
+    
+    # Allow trailing commas
+    content = re.sub(r',(\s*[}\]])', r'\1', content)
+    
+    # Allow unquoted keys
+    content = re.sub(r'([\{\,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', content)
+    
+    # Parse as regular JSON
+    return json.loads(content)
 
 class TopicDataWidget(QWidget):
     """Widget for displaying a single topic's data"""
@@ -222,6 +239,7 @@ class ROSArrayAnalyzer(QMainWindow):
         self.subscriptions = {}  # {topic_name: subscription}
         self.topic_widgets = {}  # {topic_name: TopicDataWidget}
         self.zenoh_router_process = None  # For Zenoh router management
+        self.config_file_path = None
         
         # Setup UI
         self.setup_ui()
@@ -247,7 +265,7 @@ class ROSArrayAnalyzer(QMainWindow):
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         
-        # Domain ID selector and RMW configuration
+        # Configuration section
         config_group = QGroupBox("ROS2 Configuration")
         config_layout = QVBoxLayout()
         
@@ -256,12 +274,34 @@ class ROSArrayAnalyzer(QMainWindow):
         rmw_label = QLabel("RMW Implementation:")
         self.rmw_combo = QComboBox()
         self.rmw_combo.addItems(self.RMW_IMPLEMENTATIONS.keys())
-        self.rmw_combo.setCurrentText("Zenoh")  # Default to Zenoh
+        self.rmw_combo.setCurrentText("Zenoh")
         self.rmw_combo.currentTextChanged.connect(self.on_rmw_changed)
         
         rmw_row.addWidget(rmw_label)
         rmw_row.addWidget(self.rmw_combo)
         rmw_row.addStretch()
+        
+        # Network Configuration
+        network_row = QHBoxLayout()
+        
+        # Remote IP
+        remote_ip_layout = QHBoxLayout()
+        remote_ip_label = QLabel("Remote IP:")
+        self.remote_ip_edit = QLineEdit()
+        self.remote_ip_edit.setPlaceholderText("e.g., 192.168.1.100")
+        remote_ip_layout.addWidget(remote_ip_label)
+        remote_ip_layout.addWidget(self.remote_ip_edit)
+        
+        # Interface
+        iface_layout = QHBoxLayout()
+        iface_label = QLabel("Interface:")
+        self.iface_edit = QLineEdit()
+        self.iface_edit.setPlaceholderText("e.g., eth0")
+        iface_layout.addWidget(iface_label)
+        iface_layout.addWidget(self.iface_edit)
+        
+        network_row.addLayout(remote_ip_layout)
+        network_row.addLayout(iface_layout)
         
         # Domain ID row
         domain_row = QHBoxLayout()
@@ -277,35 +317,27 @@ class ROSArrayAnalyzer(QMainWindow):
         domain_row.addWidget(self.domain_apply_btn)
         domain_row.addStretch()
         
-        # Zenoh specific configuration row
+        # Add rows to config layout
+        config_layout.addLayout(rmw_row)
+        config_layout.addLayout(network_row)
+        config_layout.addLayout(domain_row)
+        config_group.setLayout(config_layout)
+        layout.addWidget(config_group)
+        
+        # Zenoh Configuration
         self.zenoh_config_group = QGroupBox("Zenoh Configuration")
         zenoh_layout = QHBoxLayout()
+        
         self.start_router_cb = QCheckBox("Start Zenoh Router")
         self.start_router_cb.setChecked(False)
         self.peer_discovery_cb = QCheckBox("Enable Peer Discovery")
-        self.peer_discovery_cb.setChecked(True)
-        
-        self.start_router_cb.setToolTip(
-            "Check this if you want the application to start a Zenoh router.\n"
-            "Leave unchecked if you already have a router running."
-        )
-        self.peer_discovery_cb.setToolTip(
-            "Enable multicast-based peer discovery.\n"
-            "Useful when connecting to other ROS2 nodes on the network."
-        )
+        self.peer_discovery_cb.setChecked(False)  # Default to false as per standard config
         
         zenoh_layout.addWidget(self.start_router_cb)
         zenoh_layout.addWidget(self.peer_discovery_cb)
         zenoh_layout.addStretch()
+        
         self.zenoh_config_group.setLayout(zenoh_layout)
-        
-        # Add all rows to config layout
-        config_layout.addLayout(rmw_row)
-        config_layout.addLayout(domain_row)
-        config_group.setLayout(config_layout)
-        
-        # Add groups to main layout
-        layout.addWidget(config_group)
         layout.addWidget(self.zenoh_config_group)
         
         # Connection status
@@ -352,6 +384,65 @@ class ROSArrayAnalyzer(QMainWindow):
             QMessageBox.information(self, "RMW Changed",
                                   "Please reconnect to apply the new RMW implementation.")
 
+    def generate_zenoh_config(self):
+        """Generate standard Zenoh configuration"""
+        remote_ip = self.remote_ip_edit.text().strip() or "localhost"
+        iface = self.iface_edit.text().strip() or "lo"
+        
+        config = {
+            "mode": "peer",
+            "connect": {
+                "timeout_ms": -1,
+                "endpoints": {
+                    "router": [f"tcp/{remote_ip}:55020#iface={iface}"],
+                    "peer": ["tcp/localhost:55000"],
+                    "client": ["tcp/localhost:55000"],
+                },
+                "exit_on_failure": {
+                    "router": False,
+                    "peer": False,
+                    "client": True
+                },
+                "retry": {
+                    "period_init_ms": 1000,
+                    "period_max_ms": 4000,
+                    "period_increase_factor": 2,
+                },
+            },
+            "listen": {
+                "timeout_ms": 0,
+                "endpoints": {
+                    "router": [
+                        f"tcp/{remote_ip}:55020#iface={iface}",
+                        "tcp/localhost:55000"
+                    ],
+                    "peer": ["tcp/localhost:0"],
+                    "client": ["tcp/localhost:0"]
+                },
+                "exit_on_failure": {
+                    "router": False,
+                    "peer": True,
+                    "client": True
+                },
+                "retry": {
+                    "period_init_ms": 1000,
+                    "period_max_ms": 4000,
+                    "period_increase_factor": 2,
+                },
+            },
+            "scouting": {
+                "multicast": {
+                    "enabled": False,
+                },
+            },
+            "timestamping": {
+                "enabled": True,
+                "drop_future_timestamp": False,
+            },
+        }
+        
+        return config
+
     def init_ros(self):
         """Initialize or reinitialize ROS2 with current domain ID"""
         try:
@@ -363,40 +454,66 @@ class ROSArrayAnalyzer(QMainWindow):
             os.environ['RMW_IMPLEMENTATION'] = self.RMW_IMPLEMENTATIONS[rmw_name]
             os.environ['ROS_DOMAIN_ID'] = str(self.current_domain_id)
             
+            # Set default Zenoh router check attempts
+            os.environ['ZENOH_ROUTER_CHECK_ATTEMPTS'] = '5'
+            
             if rmw_name == "Zenoh":
-                # Configure Zenoh peer discovery
-                if self.peer_discovery_cb.isChecked():
-                    os.environ['ZENOH_PEER_MULTICAST_ENABLED'] = 'true'
-                    os.environ['ZENOH_PEER_MULTICAST_ADDRESS'] = '224.0.0.224'
-                    os.environ['ZENOH_PEER_MULTICAST_INTERFACE'] = 'auto'
-                else:
-                    os.environ['ZENOH_PEER_MULTICAST_ENABLED'] = 'false'
+                # Generate config based on UI settings
+                config = self.generate_zenoh_config()
                 
-                # Start Zenoh router if requested
+                # Create temporary config file
+                config_dir = "/tmp/zenoh"
+                os.makedirs(config_dir, exist_ok=True)
+                config_path = os.path.join(config_dir, "analyzer_config.json5")
+                
+                # Add JSON5 comments
+                config_content = """/// ROS2 Array Analyzer Zenoh Configuration
+/// Generated configuration for RMW Zenoh
+/// See https://github.com/ros2/rmw_zenoh/tree/jazzy for more details.
+"""
+                config_content += json.dumps(config, indent=2)
+                
+                with open(config_path, 'w') as f:
+                    f.write(config_content)
+                
+                # Set Zenoh config environment variables
+                os.environ['ZENOH_SESSION_CONFIG_URI'] = config_path
+                
+                print("Using Zenoh configuration:")
+                print(config_content)
+                
                 if self.start_router_cb.isChecked():
                     try:
-                        # Kill any existing router process
                         if self.zenoh_router_process:
                             self.zenoh_router_process.terminate()
                             self.zenoh_router_process.wait(timeout=2)
                         
-                        # Start new router process
+                        router_config = dict(config)
+                        router_config["mode"] = "router"
+                        router_config_path = os.path.join(config_dir, "analyzer_router_config.json5")
+                        
+                        with open(router_config_path, 'w') as f:
+                            f.write("/// Zenoh Router Configuration\n")
+                            json.dump(router_config, f, indent=2)
+                        
+                        router_cmd = ['ros2', 'run', 'rmw_zenoh_cpp', 'rmw_zenohd',
+                                    '--config', router_config_path]
+                        
                         self.zenoh_router_process = subprocess.Popen(
-                            ['ros2', 'run', 'rmw_zenoh_cpp', 'rmw_zenohd'],
+                            router_cmd,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
                             preexec_fn=os.setsid
                         )
-                        # Give the router a moment to start
-                        QTimer.singleShot(1000, self.continue_ros_init)
+                        QTimer.singleShot(2000, self.continue_ros_init)
                         return True
                     except Exception as e:
                         QMessageBox.warning(self, "Warning", 
                                           f"Failed to start Zenoh router: {str(e)}\n"
                                           "Will attempt to connect to existing router.")
                         return self.continue_ros_init()
-            else:  # FastRTPS
-                return self.continue_ros_init()
+            
+            return self.continue_ros_init()
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to initialize ROS2: {str(e)}")
